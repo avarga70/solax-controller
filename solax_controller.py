@@ -44,7 +44,6 @@ import urllib.request
 from datetime import datetime, date, timedelta
 from typing import Optional
 
-import aiohttp
 import mysql.connector
 import solax
 
@@ -651,17 +650,16 @@ _WRITE_STUB_NOTE = (
 
 async def read_inverter() -> dict:
     """Read current state from Solax inverter via HTTP local API."""
-    async with aiohttp.ClientSession() as session:
-        inverter = await solax.discover(INVERTER_IP, INVERTER_PORT, INVERTER_PASSWORD, session)
-        response = await inverter.get_data()
-        data = response.data
-        return {
-            "soc": data.get("battery_percent", 0),
-            "ppv": data.get("power_dc1", 0) + data.get("power_dc2", 0),
-            "pgrid": data.get("feedin_power", 0),
-            "pload": data.get("load_power", 0),
-            "pbatt": data.get("battery_power", 0),
-        }
+    inverter = await solax.discover(INVERTER_IP, INVERTER_PORT, INVERTER_PASSWORD)
+    response = await inverter.get_data()
+    data = response.data
+    return {
+        "soc": data.get("battery_percent", 0),
+        "ppv": data.get("power_dc1", 0) + data.get("power_dc2", 0),
+        "pgrid": data.get("feedin_power", 0),
+        "pload": data.get("load_power", 0),
+        "pbatt": data.get("battery_power", 0),
+    }
 
 
 async def apply_mode(target: OperationMode, current: OperationMode) -> None:

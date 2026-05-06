@@ -10,7 +10,6 @@ import os
 import time
 from datetime import datetime
 
-import aiohttp
 import mysql.connector
 import solax
 
@@ -49,7 +48,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
     handlers=[
-        logging.FileHandler("/var/log/solax_poller.log"),
+        logging.FileHandler("/home/avarga/AI/solax/solax_poller.log"),
         logging.StreamHandler(),
     ],
 )
@@ -71,18 +70,17 @@ CREATE TABLE IF NOT EXISTS `PV_run` (
 
 
 async def read_inverter() -> dict:
-    async with aiohttp.ClientSession() as session:
-        inverter = await solax.discover(INVERTER_IP, INVERTER_PORT, INVERTER_PASSWORD, session)
-        response = await inverter.get_data()
-        d = response.data
-        return {
-            "ppv": int(d.get("power_dc1", 0) + d.get("power_dc2", 0)),
-            "pgrid": int(d.get("feedin_power", 0)),
-            "pbatt": int(d.get("battery_power", 0)),
-            "soc": float(d.get("battery_percent", 0)),
-            "pload": int(d.get("load_power", 0)),
-            "temp": float(d.get("inverter_temperature", 0)),
-        }
+    inverter = await solax.discover(INVERTER_IP, INVERTER_PORT, INVERTER_PASSWORD)
+    response = await inverter.get_data()
+    d = response.data
+    return {
+        "ppv": int(d.get("power_dc1", 0) + d.get("power_dc2", 0)),
+        "pgrid": int(d.get("feedin_power", 0)),
+        "pbatt": int(d.get("battery_power", 0)),
+        "soc": float(d.get("battery_percent", 0)),
+        "pload": int(d.get("load_power", 0)),
+        "temp": float(d.get("inverter_temperature", 0)),
+    }
 
 
 def store_reading(db, reading: dict) -> None:

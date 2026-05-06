@@ -481,7 +481,7 @@ def ensure_decisions_table() -> None:
 # ── Manual override table ─────────────────────────────────────────────────────
 
 _CONTROL_DDL = """
-CREATE TABLE IF NOT EXISTS solar_control (
+CREATE TABLE IF NOT EXISTS solax_control (
     id           INT          NOT NULL DEFAULT 1,
     manual_mode  TINYINT(1)   NOT NULL DEFAULT 0  COMMENT '1 = manual, 0 = auto',
     forced_mode  VARCHAR(20)      NULL             COMMENT 'ECO_CHARGE / BACKUP / GENERAL',
@@ -500,13 +500,13 @@ def ensure_control_table() -> None:
         cur.execute(_CONTROL_DDL)
         # Ensure the single control row exists
         cur.execute(
-            "INSERT IGNORE INTO solar_control (id, manual_mode) VALUES (1, 0)"
+            "INSERT IGNORE INTO solax_control (id, manual_mode) VALUES (1, 0)"
         )
         conn.commit()
         cur.close()
         conn.close()
     except Exception as exc:
-        log.warning(f"Could not create solar_control table: {exc}")
+        log.warning(f"Could not create solax_control table: {exc}")
 
 
 def read_manual_override() -> tuple[bool, Optional[str], Optional[int]]:
@@ -517,14 +517,14 @@ def read_manual_override() -> tuple[bool, Optional[str], Optional[int]]:
     try:
         conn = db_connect()
         cur  = conn.cursor()
-        cur.execute("SELECT manual_mode, forced_mode, forced_min_soc FROM solar_control WHERE id=1")
+        cur.execute("SELECT manual_mode, forced_mode, forced_min_soc FROM solax_control WHERE id=1")
         row = cur.fetchone()
         cur.close()
         conn.close()
         if row:
             return bool(row[0]), row[1], row[2]
     except Exception as exc:
-        log.warning(f"Could not read solar_control: {exc}")
+        log.warning(f"Could not read solax_control: {exc}")
     return False, None, None
 
 

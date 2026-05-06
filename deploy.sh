@@ -1,49 +1,44 @@
-#!/bin/bash
-# Deploy solar_controller.py (and optionally other files) to both nodes
-# Usage: ./deploy.sh [--restart]
-
+#!/usr/bin/env bash
 set -euo pipefail
 
-NODES=(node1 node2)
-REMOTE_DIR="/home/avarga/AI/solar"
-WEB_DIR="/data/www/webdav/solar"
+REMOTE=solman
+REMOTE_DIR="/home/avarga/AI/solax"
+WEB_DIR="/var/www/html/solax"
+VENV="$REMOTE_DIR/venv"
+
 DEPLOY_FILES=(
-    solar_controller.py
-    check_inverter.py
+    solax_controller.py
+    solax_poller.py
     download_pnd.py
-    run_pnd.sh
     config.env.example
-    planned_outages.json
     requirements.txt
 )
 
 RESTART=0
-for arg in "$@"; do
-    [[ "$arg" == "--restart" ]] && RESTART=1
-done
+for arg in "$@"; do [[ "$arg" == "--restart" ]] && RESTART=1; done
 
-for node in "${NODES[@]}"; do
-    echo "=== Deploying to $node ==="
-    ssh "$node" "mkdir -p $REMOTE_DIR"
-    rsync -av --files-from=<(printf '%s\n' "${DEPLOY_FILES[@]}") \
-        . "$node:$REMOTE_DIR/"
+echo "Deploying to $REMOTE..."
+ssh "$REMOTE" "mkdir -p $REMOTE_DIR"
+rsync -av --files-from=<(printf '%s\n' "${DEPLOY_FILES[@]}") \
+    . "$REMOTE:$REMOTE_DIR/"
 
-    echo "  Deploying web UI to $node:$WEB_DIR ..."
-    ssh "$node" "mkdir -p $WEB_DIR"
-    rsync -av solar_web/ "$node:$WEB_DIR/"
+echo "Installing Python dependencies..."
+ssh "$REMOTE" "$VENV/bin/pip install -q -r $REMOTE_DIR/requirements.txt"
 
-    if [[ $RESTART -eq 1 ]]; then
-        echo "  Restarting solar-controller on $node..."
-        ssh "$node" "sudo systemctl restart solar-controller" && echo "  Restarted."
-    fi
-done
+if [[ -d solar_web ]]; then
+    echo "Deploying web UI..."
+    ssh "$REMOTE" "sudo mkdir -p $WEB_DIR && sudo chown avarga:www-data $WEB_DIR"
+    rsync -av solar_web/ "$REMOTE:$WEB_DIR/"
+fi
 
+if [[ $RESTART -eq 1 ]]; then
+    echo "Restarting services..."
+    ssh "$REMOTE" "sudo systemctl restart solax-controller solax-poller 2>/dev/null || true"
+fi
+
+echo "Deploy complete."
 echo ""
-echo "Done. To also restart the service: ./deploy.sh --restart"
-echo ""
-echo "First-time web UI setup (run once per node):"
-echo "  sudo mkdir -p /etc/solar"
-echo "  sudo cp $WEB_DIR/db.php.example /etc/solar/db.php"
-echo "  sudo nano /etc/solar/db.php          # fill in credentials"
-echo "  sudo htpasswd -c /etc/solar/.htpasswd solar   # create web UI user"
-echo "  sudo chmod 640 /etc/solar/db.php /etc/solar/.htpasswd"
+echo "Quick start on $REMOTE:"
+echo "  sudo mkdir -p /etc/solax"
+echo "  sudo cp $REMOTE_DIR/config.env.example /etc/solax/config.env"
+echo "  # Edit /etc/solax/config.env with your inverter IP and DB password"

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-solar_controller.py — Intelligent GoodWe 10K ET Solar System Controller
+solax_controller.py — Intelligent Solax Solar System Controller
 
 Runs as a daemon and evaluates the optimal inverter operation mode every
 LOOP_INTERVAL_MINUTES (default: 5).  In TEST mode it only prints what it
@@ -8,15 +8,15 @@ LOOP_INTERVAL_MINUTES (default: 5).  In TEST mode it only prints what it
 
 Decision inputs
   - Czech OTE spot electricity prices    (spotovaelektrina.cz API)
-  - Current battery SOC + inverter state (goodwe library, UDP/8899)
+  - Current battery SOC + inverter state (Solax local HTTP API)
   - Historical consumption & PV patterns (MySQL PV_run table)
 
 Usage
   # Normal (control) mode:
-  python3 solar_controller.py
+  python3 solax_controller.py
 
   # Test / dry-run mode — prints decisions, touches nothing:
-  python3 solar_controller.py --test
+  python3 solax_controller.py --test
   # or: set TEST_MODE=1 in config.env
 
 Configuration
@@ -25,10 +25,10 @@ Configuration
 PV_run columns used
   pdtime  — datetime
   ppv     — PV generation (W)
-  phousT  — house load (W)
-  pgridT  — grid power (W, + import / – export)
+  ploadT  — house load (W)
+  pgridT  — grid power (W, + export / – import)
   pbatts  — battery SOC (%)
-  pbattp  — battery power (W, + charging / – discharging)
+  pbattw  — battery power (W, + charging / – discharging)
   psource — data source identifier (filter via PV_SOURCE env var)
 """
 
@@ -44,21 +44,39 @@ import urllib.request
 from datetime import datetime, date, timedelta
 from typing import Optional
 
-import goodwe
-from goodwe.et import OperationMode
+import aiohttp
 import mysql.connector
-from dotenv import load_dotenv
+import solax
 
 
 # ── Bootstrap ─────────────────────────────────────────────────────────────────
 
+def _load_env_file(path: str) -> None:
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if value and value[0] == value[-1] and value[0] in {'"', "'"}:
+                value = value[1:-1]
+            elif " #" in value:
+                value = value.split(" #", 1)[0].rstrip()
+            os.environ.setdefault(key, value)
+
+
 _cfg_path = os.path.join(os.path.dirname(__file__), "config.env")
-load_dotenv(_cfg_path)
+_load_env_file(_cfg_path)
 
 TEST_MODE = ("--test" in sys.argv) or (os.getenv("TEST_MODE", "0") == "1")
+OperationMode = str
 
 _log_dir  = os.path.dirname(os.path.abspath(__file__))
-_log_file = os.path.join(_log_dir, "solar.log")
+_log_file = os.path.join(_log_dir, "solax.log")
 
 _fmt = logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
@@ -71,7 +89,7 @@ _console_handler = logging.StreamHandler(sys.stdout)
 _console_handler.setFormatter(_fmt)
 
 logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _console_handler])
-log = logging.getLogger("solar")
+log = logging.getLogger("solax")
 
 
 def _req(key: str) -> str:
@@ -83,14 +101,16 @@ def _req(key: str) -> str:
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-INVERTER_IP        = _req("INVERTER_IP")
+INVERTER_IP        = os.getenv("INVERTER_IP", "")
+INVERTER_PORT      = int(os.getenv("INVERTER_PORT", "80"))
+INVERTER_PASSWORD  = os.getenv("INVERTER_PASSWORD", "")
 MYSQL_HOST         = _req("MYSQL_HOST")
 MYSQL_DB           = _req("MYSQL_DB")
 MYSQL_USER         = _req("MYSQL_USER")
 MYSQL_PASSWORD     = _req("MYSQL_PASSWORD")
 
-PV_SOURCE          = os.getenv("PV_SOURCE", "VV_PV")
-BATTERY_CAPACITY   = int(os.getenv("BATTERY_CAPACITY_WH", "7100"))   # Wh  (GoodWe LX U5.4-L × 2 = 7.1 kWh usable)
+PV_SOURCE          = os.getenv("PV_SOURCE", "SOLAX")
+BATTERY_CAPACITY   = int(os.getenv("BATTERY_CAPACITY_WH", "7100"))   # Wh usable battery capacity
 CHARGE_RATE_W      = int(os.getenv("CHARGE_RATE_W", "2750"))          # W   (20→98% in ~2h → (0.78×7100)/2)
 # Dynamic thresholds: CHEAP_PERCENTILE lowest hours = cheap, top = expensive
 # Fixed fallbacks used only when fewer than 24 h of price data are available
@@ -165,12 +185,9 @@ PV_DEC = int(os.getenv("PV_DEC", "30"))      # panel tilt °  0=horizontal, 90=v
 PV_AZ  = int(os.getenv("PV_AZ",  "0"))       # panel azimuth °  -90=E, 0=S, 90=W
 PV_KWP = float(os.getenv("PV_KWP", "0"))     # installed peak power in kWp
 
-# ── HA / leader-election ───────────────────────────────────────────────────────
-import socket as _socket
-HA_ENABLED   = os.getenv("HA_ENABLED", "0") == "1"
-NODE_NAME    = os.getenv("NODE_NAME", _socket.gethostname())
-# Lease held for 2 full loop intervals + 30 s grace — other node takes over after that
-LEASE_TTL_S  = LOOP_INTERVAL_MIN * 60 * 2 + 30
+# ── Single-node operation ───────────────────────────────────────────────────
+NODE_NAME    = os.getenv("NODE_NAME", os.uname().nodename)
+IS_LEADER    = True
 
 
 # ── Electricity Prices (EL_dailypr table) ─────────────────────────────────────
@@ -428,7 +445,7 @@ def db_connect():
 
 
 _DECISIONS_DDL = """
-CREATE TABLE IF NOT EXISTS solar_decisions (
+CREATE TABLE IF NOT EXISTS solax_decisions (
     id           BIGINT       NOT NULL AUTO_INCREMENT,
     logged_at    DATETIME     NOT NULL,
     node_name    VARCHAR(100) NOT NULL,
@@ -446,7 +463,7 @@ CREATE TABLE IF NOT EXISTS solar_decisions (
     reason       TEXT,
     PRIMARY KEY (id),
     INDEX idx_logged_at (logged_at)
-) ENGINE=InnoDB COMMENT='Solar controller decision log';
+) ENGINE=InnoDB COMMENT='Solax controller decision log';
 """
 
 
@@ -459,7 +476,7 @@ def ensure_decisions_table() -> None:
         cur.close()
         conn.close()
     except Exception as exc:
-        log.warning(f"Could not create solar_decisions table: {exc}")
+        log.warning(f"Could not create solax_decisions table: {exc}")
 
 
 # ── Manual override table ─────────────────────────────────────────────────────
@@ -473,7 +490,7 @@ CREATE TABLE IF NOT EXISTS solar_control (
     updated_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     updated_by   VARCHAR(64)      NULL             COMMENT 'who set the override (web/node/user)',
     PRIMARY KEY (id)
-) ENGINE=InnoDB COMMENT='Solar controller manual override state (single-row)';
+) ENGINE=InnoDB COMMENT='Solax controller manual override state (single-row)';
 """
 
 
@@ -521,9 +538,9 @@ def log_decision(
     target_min_soc: int,
     reason: str,
 ) -> None:
-    """Insert one row into solar_decisions for every leader cycle."""
+    """Insert one row into solax_decisions for every controller cycle."""
     sql = """
-        INSERT INTO solar_decisions
+        INSERT INTO solax_decisions
             (logged_at, node_name, is_leader, test_mode,
              soc_pct, pv_w, grid_w, load_w, battery_w,
              price_now, current_mode, target_mode, target_min_soc, reason)
@@ -538,7 +555,7 @@ def log_decision(
             int(state["pv_w"]), int(state["grid_w"]),
             int(state["load_w"]), int(state["battery_w"]),
             round(price_now, 2) if price_now is not None else None,
-            state["mode"].name, target_mode.name, target_min_soc,
+            state["mode"], target_mode, target_min_soc,
             reason,
         ))
         conn.commit()
@@ -558,7 +575,7 @@ def query_hourly_patterns(month: int) -> dict[int, dict]:
         SELECT
             HOUR(pdtime)     AS h,
             AVG(ppv)         AS avg_pv_w,
-            AVG(phousT)      AS avg_load_w,
+            AVG(ploadT)      AS avg_load_w,
             AVG(pbatts)      AS avg_soc_pct,
             AVG(pgridT)      AS avg_grid_w,
             COUNT(*)         AS n
@@ -613,78 +630,6 @@ def expected_load_wh(patterns: dict[int, dict], from_hour: int, to_hour: int = 2
     return total
 
 
-# ── HA Leader Election (MySQL lease table) ────────────────────────────────────
-# Works correctly with Percona XtraDB Cluster / Galera because the UPDATE is
-# a standard InnoDB write replicated across all PXC nodes.
-
-_HA_DDL = """
-CREATE TABLE IF NOT EXISTS solar_leader_lease (
-    id          INT          NOT NULL DEFAULT 1,
-    node_name   VARCHAR(100) NOT NULL,
-    expires_at  DATETIME     NOT NULL,
-    PRIMARY KEY (id)
-) ENGINE=InnoDB COMMENT='Solar controller HA leader lease';
-"""
-_HA_SEED = """
-INSERT IGNORE INTO solar_leader_lease (id, node_name, expires_at)
-VALUES (1, 'none', '2000-01-01 00:00:00');
-"""
-
-
-def ensure_lease_table() -> None:
-    """Create the lease table and seed row if they don't exist yet."""
-    try:
-        conn = db_connect()
-        cur  = conn.cursor()
-        cur.execute(_HA_DDL)
-        cur.execute(_HA_SEED)
-        conn.commit()
-        cur.close()
-        conn.close()
-        log.info("HA lease table ready")
-    except Exception as exc:
-        log.error(f"Could not create lease table: {exc}")
-
-
-def acquire_or_renew_lease() -> tuple[bool, str]:
-    """
-    Atomically try to acquire or renew the leader lease for NODE_NAME.
-    Returns (is_leader: bool, current_holder: str).
-
-    The UPDATE succeeds only when:
-      - this node already holds the lease  (node_name = NODE_NAME), OR
-      - the current lease has expired       (expires_at < NOW())
-    This prevents split-brain across PXC nodes.
-    """
-    sql_update = """
-        UPDATE solar_leader_lease
-        SET node_name  = %s,
-            expires_at = DATE_ADD(NOW(), INTERVAL %s SECOND)
-        WHERE id = 1
-          AND (node_name = %s OR expires_at < NOW())
-    """
-    sql_select = "SELECT node_name, expires_at FROM solar_leader_lease WHERE id = 1"
-    for attempt in range(3):
-        try:
-            conn = db_connect()
-            cur  = conn.cursor(dictionary=True)
-            cur.execute(sql_update, (NODE_NAME, LEASE_TTL_S, NODE_NAME))
-            conn.commit()
-            won = cur.rowcount == 1
-            cur.execute(sql_select)
-            row = cur.fetchone()
-            cur.close()
-            conn.close()
-            holder = row["node_name"] if row else "unknown"
-            return won, holder
-        except Exception as exc:
-            if attempt < 2:
-                time.sleep(0.5 + attempt)
-                continue
-            log.warning(f"HA lease check failed after {attempt+1} attempts: {exc} — assuming non-leader")
-            return False, "unknown"
-    return False, "unknown"
-
 
 def expected_night_load_wh(patterns: dict[int, dict]) -> float:
     """Estimated overnight house consumption (21:00–06:00) in Wh."""
@@ -694,140 +639,49 @@ def expected_night_load_wh(patterns: dict[int, dict]) -> float:
 
 # ── Inverter I/O ──────────────────────────────────────────────────────────────
 
-def _get(data: dict, *keys, default: float = 0.0) -> float:
-    """Safely pull a float from a runtime-data dict trying multiple key names."""
-    for k in keys:
-        if k in data and data[k] is not None:
-            return float(data[k])
-    return default
+# Solax inverter control (mode changes, min-SOC writes, export limiting) requires
+# direct HTTP POST calls to model-specific local API endpoints such as
+# /api/realTimeData.htm or related URLs. Keep these as stubs until the exact
+# inverter model and writable endpoints are confirmed.
+_WRITE_STUB_NOTE = (
+    "Solax write not yet implemented; control requires model-specific local HTTP "
+    "POST endpoints once the inverter model is confirmed."
+)
 
 
-async def read_inverter(ip: str) -> tuple:
-    """
-    Connect to inverter and return (inverter_obj, state_dict).
-    state_dict keys: soc, pv_w, grid_w, load_w, battery_w, mode
-    Each call is wrapped with a 15-second timeout to avoid hanging when the
-    inverter is busy (e.g. another script polling simultaneously).
-    """
-    inv  = await asyncio.wait_for(goodwe.connect(ip), timeout=15)
-    data = await asyncio.wait_for(inv.read_runtime_data(), timeout=15)
-    mode = await asyncio.wait_for(inv.get_operation_mode(), timeout=15)
-    state = {
-        "mode":      mode,
-        "soc":       _get(data, "battery_soc", "soc"),
-        "pv_w":      _get(data, "ppv", "pv_power", "ppv1") + _get(data, "ppv2"),
-        "grid_w":    _get(data, "pgrid_in_total", "grid_in_total", "pgridT", "active_power"),
-        "load_w":    _get(data, "house_consumption", "load_power", "phousT", "pload_total"),
-        "battery_w": _get(data, "pbattery1", "battery_power", "pbattp"),
-    }
-    return inv, state
+async def read_inverter() -> dict:
+    """Read current state from Solax inverter via HTTP local API."""
+    async with aiohttp.ClientSession() as session:
+        inverter = await solax.discover(INVERTER_IP, INVERTER_PORT, INVERTER_PASSWORD, session)
+        response = await inverter.get_data()
+        data = response.data
+        return {
+            "soc": data.get("battery_percent", 0),
+            "ppv": data.get("power_dc1", 0) + data.get("power_dc2", 0),
+            "pgrid": data.get("feedin_power", 0),
+            "pload": data.get("load_power", 0),
+            "pbatt": data.get("battery_power", 0),
+        }
 
 
-async def apply_mode(inv, target: OperationMode, current: OperationMode) -> None:
-    """Set inverter operation mode (skipped in TEST mode or if already set)."""
+async def apply_mode(target: OperationMode, current: OperationMode) -> None:
+    """Stub for Solax mode writes until model-specific local API control is implemented."""
     if target == current:
-        log.info(f"  → Mode already {current.name}, no change needed")
+        log.info(f"  → Mode already {current}, no change needed")
         return
-    cmd = f"inv.set_operation_mode({target.name})"
-    if TEST_MODE:
-        log.info(f"  [TEST] Would send: {cmd}  ({current.name} → {target.name})")
-        return
-    log.info(f"  Sending: {cmd}  ({current.name} → {target.name})")
-    await inv.set_operation_mode(target)
-    new_mode = await inv.get_operation_mode()
-    if new_mode != target:
-        log.error(f"  Mode write failed! Expected {target.name}, got {new_mode.name}")
-    else:
-        log.info(f"  Confirmed: mode={new_mode.name}")
+    log.warning(f"  Solax write not yet implemented: mode {current} → {target}. {_WRITE_STUB_NOTE}")
 
 
-async def apply_min_soc(inv, target_soc: int) -> None:
-    """
-    Write the battery minimum discharge SOC to the inverter.
-    GoodWe ET key: 'battery_discharge_depth' — stores min SOC % directly
-    (Solar Go shows this as DoD, but the inverter register is SOC%).
-    Clamps to [MIN_SOC_FLOOR, CHARGE_SOC_LIMIT] for safety.
-    Skips the write when the value is unchanged (reads from inverter first,
-    falls back to in-memory tracking when read_setting is unsupported).
-    """
-    global _last_min_soc
-    KEY = "battery_discharge_depth"
+async def apply_min_soc(target_soc: int) -> None:
+    """Stub for Solax minimum-SOC writes until model-specific local API control is implemented."""
     target_soc = max(MIN_SOC_FLOOR, min(target_soc, CHARGE_SOC_LIMIT))
-
-    # ── Try to read current value from inverter ────────────────────────────────
-    read_ok = False
-    try:
-        current_val = int(await inv.read_setting(KEY))
-        read_ok = True
-        if current_val == target_soc:
-            log.info(f"  → Min SOC already {target_soc}% (read from inverter), no change needed")
-            _last_min_soc = target_soc
-            return
-    except Exception:
-        pass  # fall through to in-memory check
-
-    # ── Fallback: in-memory tracking ──────────────────────────────────────────
-    if not read_ok and _last_min_soc == target_soc:
-        log.info(f"  → Min SOC already {target_soc}% (last written value), no change needed")
-        return
-
-    # ── Write ──────────────────────────────────────────────────────────────────
-    cmd = f"inv.write_setting('{KEY}', {target_soc})"
-    if TEST_MODE:
-        log.info(f"  [TEST] Would send: {cmd}")
-        _last_min_soc = target_soc
-        return
-    try:
-        log.info(f"  Sending: {cmd}")
-        await inv.write_setting(KEY, target_soc)
-        log.info(f"  Confirmed: battery_discharge_depth={target_soc}% (min SOC)")
-        _last_min_soc = target_soc
-    except Exception as exc:
-        log.warning(f"  Could not write battery_discharge_depth: {exc}")
+    log.warning(f"  Solax write not yet implemented: min SOC -> {target_soc}%. {_WRITE_STUB_NOTE}")
 
 
-async def apply_export_block(inv, should_block: bool) -> None:
-    """
-    Enable (should_block=True) or disable the GoodWe grid export limit.
-
-    Blocking sets grid_export=1 (enable feature) and grid_export_limit=0 W,
-    which forces the inverter to curtail excess PV instead of exporting it.
-    Restoring sets grid_export=0 (disable feature) — the limit value is ignored.
-
-    Skips the write when the state is already correct (tracked in _export_blocked).
-    """
-    global _export_blocked
-    if _export_blocked is not None and _export_blocked == should_block:
-        if should_block:
-            log.info("  → Export block already active, no change")
-        return
-    if should_block:
-        cmd = "write_setting('grid_export', 1) + write_setting('grid_export_limit', 0)"
-        if TEST_MODE:
-            log.info(f"  [TEST] Would send: {cmd}  (export block ON — curtail surplus PV)")
-            _export_blocked = True
-            return
-        try:
-            log.info(f"  Sending: {cmd}  (export block ON)")
-            await inv.write_setting("grid_export", 1)
-            await inv.write_setting("grid_export_limit", 0)
-            log.info("  Confirmed: grid export blocked (limit=0 W, surplus PV curtailed)")
-            _export_blocked = True
-        except Exception as exc:
-            log.warning(f"  Could not enable export block: {exc}")
-    else:
-        cmd = "write_setting('grid_export', 0)  (disable export limit)"
-        if TEST_MODE:
-            log.info(f"  [TEST] Would send: {cmd}  (export block OFF)")
-            _export_blocked = False
-            return
-        try:
-            log.info(f"  Sending: {cmd}  (export block OFF)")
-            await inv.write_setting("grid_export", 0)
-            log.info("  Confirmed: grid export limit disabled (unlimited)")
-            _export_blocked = False
-        except Exception as exc:
-            log.warning(f"  Could not disable export block: {exc}")
+async def apply_export_block(should_block: bool) -> None:
+    """Stub for Solax export blocking until model-specific local API control is implemented."""
+    state = "ON" if should_block else "OFF"
+    log.warning(f"  Solax write not yet implemented: export block {state}. {_WRITE_STUB_NOTE}")
 
 
 # ── Decision Logic ────────────────────────────────────────────────────────────
@@ -845,9 +699,9 @@ def decide(
     expensive_thr: float,
     eod_hour: int,
     patterns: dict,
-) -> tuple[OperationMode, int, str]:
+) -> tuple[str, int, str]:
     """
-    Returns (OperationMode, target_min_soc_pct, reason_string).
+    Returns (mode_label, target_min_soc_pct, reason_string).
 
     Thresholds are computed dynamically from the next ~24h price window
     (passed in as cheap_thr / expensive_thr) so the controller adapts to
@@ -866,7 +720,7 @@ def decide(
     current_price = prices.get(hour)
     if current_price is None:
         target_min = NIGHT_MIN_SOC if is_night else MIN_SOC
-        return OperationMode.GENERAL, target_min, "No price data available — auto mode"
+        return "GENERAL", target_min, "No price data available — auto mode"
 
     # ── Energy budget ──────────────────────────────────────────────────────────
     soc_wh           = soc / 100.0 * BATTERY_CAPACITY
@@ -920,13 +774,13 @@ def decide(
     if in_outage:
         # Grid is gone — GENERAL mode, keep battery as full as possible
         return (
-            OperationMode.GENERAL,
+            "GENERAL",
             OUTAGE_PRE_CHARGE_SOC,
             f"PLANNED OUTAGE ACTIVE — {outage_reason}",
         )
     if pre_charge and soc < OUTAGE_PRE_CHARGE_SOC:
         return (
-            OperationMode.ECO_CHARGE,
+            "ECO_CHARGE",
             OUTAGE_PRE_CHARGE_SOC,
             f"PRE-OUTAGE CHARGE — {outage_reason}",
         )
@@ -941,7 +795,7 @@ def decide(
         # During daytime always block
         if not is_night:
             return (
-                OperationMode.GENERAL,
+                "GENERAL",
                 MIN_SOC_FLOOR,
                 f"SOC {soc:.0f}% at emergency floor ({MIN_SOC_FLOOR}%) — holding, grid covers load until cheap hours",
             )
@@ -968,7 +822,7 @@ def decide(
             cheap_before_peak = [h for h in upcoming_cheap if h < next_morning_peak]
             if cheap_before_peak:
                 return (
-                    OperationMode.GENERAL,
+                    "GENERAL",
                     MIN_SOC_FLOOR,
                     f"SOC {soc:.0f}% at emergency floor ({MIN_SOC_FLOOR}%) — holding, grid covers load until cheap hours",
                 )
@@ -999,14 +853,14 @@ def decide(
             if can_wait_15:
                 hold_soc = max(MIN_SOC_SAVE, soc)
                 return (
-                    OperationMode.GENERAL,
+                    "GENERAL",
                     hold_soc,
                     f"Low price {effective_price:.1f} CZK/MWh (≤ {PRICE_NO_EXPORT:.0f}) but cheaper window ahead "
                     f"— next low-price hrs {upcoming_no_export[:3]} (cheapest {cheapest_no_exp:.1f} CZK/MWh), "
                     f"must start charging by h{last_safe_15} — holding SOC≥{hold_soc}%",
                 )
         return (
-            OperationMode.ECO_CHARGE,
+            "ECO_CHARGE",
             CHARGE_SOC_LIMIT,
             f"Very low/negative price {effective_price:.1f} CZK/MWh (≤ {PRICE_NO_EXPORT:.0f}) "
             f"— absorbing surplus PV into battery instead of exporting to grid",
@@ -1043,14 +897,14 @@ def decide(
             # battery discharge back down, causing charge/discharge oscillation every cycle.
             hold_soc = max(MIN_SOC_SAVE, soc)
             return (
-                OperationMode.GENERAL,
+                "GENERAL",
                 hold_soc,
                 f"Cheap price {effective_price:.1f} CZK/MWh but cheaper/PV window available "
                 f"— next cheap hrs {upcoming_cheap[:3]}, must start by h{last_safe_start} "
                 f"(exp. h{first_expensive}, ~{hours_to_full}h to full) — holding SOC≥{hold_soc}% until then",
             )
         return (
-            OperationMode.ECO_CHARGE,
+            "ECO_CHARGE",
             CHARGE_SOC_LIMIT,
             f"Cheap effective price {effective_price:.1f} CZK/MWh "
             f"(spot={current_price:.1f}{dist_str} ≤ {cheap_thr:.0f}) "
@@ -1304,7 +1158,7 @@ def decide(
                     price_cutoff = sorted(overnight_prices)[min(hours_needed - 1, len(overnight_prices) - 1)]
                     if current_price > price_cutoff:
                         return (
-                            OperationMode.GENERAL,
+                            "GENERAL",
                             NIGHT_MIN_SOC,
                             f"Prep-charge deferred: cheaper hour ahead "
                             f"(best={min(overnight_prices):.0f} CZK/MWh vs now={current_price:.0f}), "
@@ -1313,7 +1167,7 @@ def decide(
                 # ── Fire prep-charge ──────────────────────────────────────────
                 cheap_ref = f"today h{next_cheap_any}" if next_cheap_any else f"tomorrow h{next_cheap_tmrw}"
                 return (
-                    OperationMode.ECO_CHARGE,
+                    "ECO_CHARGE",
                     target_soc,
                     f"Overnight prep-charge: no cheap hours before h{next_expensive_h}, "
                     f"battery ({soc_wh:.0f} Wh) covers only {soc_wh - NIGHT_MIN_SOC/100*BATTERY_CAPACITY:.0f} Wh "
@@ -1473,7 +1327,7 @@ def decide(
                 f"(> break-even {break_even_sell:.0f})"
             )
         return (
-            OperationMode.GENERAL,
+            "GENERAL",
             r3_floor,
             f"{price_label} discharge_start=h{discharge_start} — min SOC lowered to {r3_floor}%, battery covers house load"
             + r3_suffix,
@@ -1489,7 +1343,7 @@ def decide(
                         if already_below_preserve or _precharge_possible
                         else preserve_min_soc)
             return (
-                OperationMode.GENERAL,
+                "GENERAL",
                 r3_floor,
                 f"Expensive price {current_price:.1f} CZK/MWh — discharging now: "
                 f"target h{discharge_start} ({discharge_start_price:.0f}) is cheaper, "
@@ -1500,7 +1354,7 @@ def decide(
         cheap_before_discharge = [h for h in upcoming_cheap if h < discharge_start]
         if cheap_before_discharge:
             return (
-                OperationMode.GENERAL,
+                "GENERAL",
                 preserve_min_soc,
                 f"Expensive price {current_price:.1f} CZK/MWh — discharging now; "
                 f"battery will recharge at h{cheap_before_discharge} before evening "
@@ -1517,14 +1371,14 @@ def decide(
         ]
         if not neutral_or_cheap_between:
             return (
-                OperationMode.GENERAL,
+                "GENERAL",
                 preserve_min_soc,
                 f"Expensive price {current_price:.1f} CZK/MWh — continuous expensive block "
                 f"to h{discharge_start}, no cheap/neutral gap — discharging through full block "
                 f"(top: h{top_hours})",
             )
         return (
-            OperationMode.GENERAL,
+            "GENERAL",
             ECO_MIN_SOC,
             f"Expensive price {current_price:.1f} CZK/MWh but holding battery for "
             f"more-expensive hours (discharge_start=h{discharge_start}, top: h{top_hours}) "
@@ -1539,7 +1393,7 @@ def decide(
         cheap_before_expensive  = [h for h in upcoming_cheap if h < first_expensive_tonight]
         if not cheap_before_expensive:
             return (
-                OperationMode.GENERAL,
+                "GENERAL",
                 MIN_SOC_SAVE,
                 f"Expensive hours coming {upcoming_expensive}, PV={pv_w:.0f} W "
                 f"— min SOC raised to {MIN_SOC_SAVE}% to save battery",
@@ -1564,7 +1418,7 @@ def decide(
             # up 1–2% then seeing Rule 5 immediately discharge back to ECO_MIN_SOC.
             hold_floor = min(CHARGE_SOC_LIMIT, max(ECO_MIN_SOC, int(soc)))
             return (
-                OperationMode.GENERAL,
+                "GENERAL",
                 hold_floor,
                 f"End-of-day: holding battery for h{discharge_start}+ "
                 f"(top remaining hours: h{top_hours}) — preserving at {hold_floor}%",
@@ -1575,14 +1429,14 @@ def decide(
             morning_cheap = [p for p in morning_prices if p <= cheap_thr]
             if morning_cheap:
                 return (
-                    OperationMode.GENERAL,
+                    "GENERAL",
                     NIGHT_MIN_SOC,
                     f"End-of-day h{discharge_start}+ discharge: tomorrow morning cheap "
                     f"(min={min(morning_cheap):.0f} CZK/MWh) — coast to {NIGHT_MIN_SOC}%",
                 )
             else:
                 return (
-                    OperationMode.GENERAL,
+                    "GENERAL",
                     MIN_SOC_SAVE,
                     f"End-of-day h{discharge_start}+ discharge: tomorrow morning expensive "
                     f"(min={min(morning_prices):.0f} CZK/MWh) — floor at {MIN_SOC_SAVE}%",
@@ -1639,7 +1493,7 @@ def decide(
             if soc >= rule6_guard:
                 if hour < drain_start:
                     return (
-                        OperationMode.GENERAL,
+                        "GENERAL",
                         hold_floor,
                         f"Overnight hold until h{drain_start}: battery will cover load "
                         f"h{drain_start}–h{next_cheap} "
@@ -1648,7 +1502,7 @@ def decide(
                     )
                 else:
                     return (
-                        OperationMode.GENERAL,
+                        "GENERAL",
                         NIGHT_MIN_SOC,
                         f"Overnight drain h{drain_start}–h{next_cheap}: battery covers "
                         f"{expected_load_wh(patterns, drain_start, to_hour=next_cheap):.0f} Wh "
@@ -1699,7 +1553,7 @@ def decide(
     else:
         target_min = MIN_SOC
     return (
-        OperationMode.GENERAL,
+        "GENERAL",
         target_min,
         f"Normal conditions: price={current_price:.1f} CZK/MWh  SOC={soc:.0f}%  "
         f"PV={pv_w:.0f} W  min_soc={target_min}%"
@@ -1715,14 +1569,8 @@ def decide(
 async def run_cycle(patterns_cache: dict) -> None:
     now = datetime.now()
 
-    # ── HA: leader election ────────────────────────────────────────────────────
-    is_leader = True
-    if HA_ENABLED:
-        is_leader, holder = acquire_or_renew_lease()
-        role = "LEADER" if is_leader else f"STANDBY (leader={holder})"
-        log.info(f"{'[TEST] ' if TEST_MODE else ''}=== Cycle {now.strftime('%Y-%m-%d %H:%M')}  [{role}] ===")
-    else:
-        log.info(f"{'[TEST] ' if TEST_MODE else ''}=== Cycle {now.strftime('%Y-%m-%d %H:%M')} ===")
+    is_leader = IS_LEADER
+    log.info(f"{'[TEST] ' if TEST_MODE else ''}=== Cycle {now.strftime('%Y-%m-%d %H:%M')} ===")
 
     # ── OTE prices ─────────────────────────────────────────────────────────────
     prices          = fetch_prices(tomorrow=False)
@@ -1738,11 +1586,6 @@ async def run_cycle(patterns_cache: dict) -> None:
         prices = {}
     if tomorrow_prices:
         log.info(f"  Tomorrow prices: {price_summary(tomorrow_prices, cheap_thr, expensive_thr)}")
-
-    # ── Historical patterns, inverter read, and control: leader only ──────────
-    if not is_leader:
-        log.info("  STANDBY — monitoring only, leader handles inverter")
-        return
 
     # ── Historical patterns (refresh once per hour) ────────────────────────────
     cache_key = (now.month, now.hour)
@@ -1781,10 +1624,18 @@ async def run_cycle(patterns_cache: dict) -> None:
 
     # ── Read inverter (both leader and standby monitor state) ──────────────────
     log.info(f"  Connecting to inverter at {INVERTER_IP} …")
-    inv, state = None, None
+    state = None
     for attempt in range(1, 4):
         try:
-            inv, state = await read_inverter(INVERTER_IP)
+            raw_state = await read_inverter()
+            state = {
+                "mode": "UNKNOWN",
+                "soc": float(raw_state.get("soc", 0)),
+                "pv_w": float(raw_state.get("ppv", 0)),
+                "grid_w": float(raw_state.get("pgrid", 0)),
+                "load_w": float(raw_state.get("pload", 0)),
+                "battery_w": float(raw_state.get("pbatt", 0)),
+            }
             break
         except Exception as exc:
             log.warning(f"  Inverter did not respond (attempt {attempt}/3): {exc}")
@@ -1795,7 +1646,7 @@ async def run_cycle(patterns_cache: dict) -> None:
         return
 
     log.info(
-        f"  Inverter state: mode={state['mode'].name}  SOC={state['soc']:.0f}%  "
+        f"  Inverter state: mode={state['mode']}  SOC={state['soc']:.0f}%  "
         f"PV={state['pv_w']:.0f} W  grid={state['grid_w']:.0f} W  "
         f"load={state['load_w']:.0f} W  battery={state['battery_w']:.0f} W"
     )
@@ -1815,7 +1666,7 @@ async def run_cycle(patterns_cache: dict) -> None:
         eod_hour=eod_hour,
         patterns=patterns,
     )
-    log.info(f"  Decision → mode={target_mode.name}  min_soc={target_min_soc}%: {reason}")
+    log.info(f"  Decision → mode={target_mode}  min_soc={target_min_soc}%: {reason}")
 
     # ── Log decision to MySQL (always, even in TEST mode) ─────────────────────
     log_decision(
@@ -1833,22 +1684,22 @@ async def run_cycle(patterns_cache: dict) -> None:
     if manual_mode:
         if forced_mode or forced_min_soc is not None:
             # User set explicit forced values — apply them to the inverter
-            apply_target_mode = OperationMode[forced_mode] if forced_mode else target_mode
+            apply_target_mode = forced_mode if forced_mode else target_mode
             apply_target_soc  = forced_min_soc if forced_min_soc is not None else target_min_soc
             log.info(
-                f"  [MANUAL] Applying forced values: mode={apply_target_mode.name}  min_soc={apply_target_soc}%"
-                f"  (controller would: mode={target_mode.name}  min_soc={target_min_soc}%)"
+                f"  [MANUAL] Applying forced values: mode={apply_target_mode}  min_soc={apply_target_soc}%"
+                f"  (controller would: mode={target_mode}  min_soc={target_min_soc}%)"
             )
-            await apply_mode(inv, apply_target_mode, state["mode"])
-            await apply_min_soc(inv, apply_target_soc)
+            await apply_mode(apply_target_mode, state["mode"])
+            await apply_min_soc(apply_target_soc)
         else:
             log.info(
                 f"  [MANUAL] Override active — inverter writes suppressed. "
-                f"Controller would: mode={target_mode.name}  min_soc={target_min_soc}%"
+                f"Controller would: mode={target_mode}  min_soc={target_min_soc}%"
             )
     else:
-        await apply_mode(inv, target_mode, state["mode"])
-        await apply_min_soc(inv, target_min_soc)
+        await apply_mode(target_mode, state["mode"])
+        await apply_min_soc(target_min_soc)
 
     # ── Export block (applied regardless of manual override) ──────────────────
     if EXPORT_BLOCK_ENABLED:
@@ -1859,14 +1710,14 @@ async def run_cycle(patterns_cache: dict) -> None:
                 f"  Export block: price {price_now_val:.1f} CZK/MWh ≤ {EXPORT_BLOCK_THRESHOLD:.0f} threshold"
                 f" — blocking grid export"
             )
-        await apply_export_block(inv, should_block_export)
+        await apply_export_block(should_block_export)
 
 
 # ── Daemon loop ───────────────────────────────────────────────────────────────
 
 async def main() -> None:
     log.info("━" * 70)
-    log.info(f"Solar Controller starting  (TEST_MODE={'ON' if TEST_MODE else 'OFF'})")
+    log.info(f"Solax Controller starting  (TEST_MODE={'ON' if TEST_MODE else 'OFF'})")
     log.info(f"  Inverter     : {INVERTER_IP}")
     log.info(f"  Loop interval: {LOOP_INTERVAL_MIN} minutes")
     log.info(
@@ -1879,14 +1730,10 @@ async def main() -> None:
     )
     log.info(f"  Battery      : {BATTERY_CAPACITY} Wh  charge_rate={CHARGE_RATE_W} W  history={HISTORY_MONTHS} months  smart_discharge={'ON' if SMART_DISCHARGE else 'OFF'}")
     log.info(f"  Outage file  : {_OUTAGES_FILE}  (max_lead={OUTAGE_LEAD_HOURS}h  target={OUTAGE_PRE_CHARGE_SOC}%)")
-    if HA_ENABLED:
-        log.info(f"  HA mode      : ENABLED  node={NODE_NAME}  lease_ttl={LEASE_TTL_S}s")
-        ensure_lease_table()
-    else:
-        log.info("  HA mode      : DISABLED (single node)")
+    log.info(f"  Controller   : single node  node={NODE_NAME}")
     ensure_decisions_table()
     ensure_control_table()
-    log.info(f"  Decision log : {_log_file}  +  MySQL solar_decisions table")
+    log.info(f"  Decision log : {_log_file}  +  MySQL solax_decisions table")
     log.info("━" * 70)
 
     once = "--once" in sys.argv

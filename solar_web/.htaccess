@@ -1,0 +1,4 @@
+AuthType Basic
+AuthName "Solar Controller"
+AuthUserFile /etc/solar/.htpasswd
+Require valid-user

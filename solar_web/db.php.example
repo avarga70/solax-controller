@@ -1,0 +1,9 @@
+<?php
+// MySQL credentials for the solar web UI
+// Deployed to /etc/solar/db.php (NOT inside web root)
+// Copy this file, fill in your values, never commit the real one.
+
+$db_host = 'vip.home.akos.name';
+$db_name = 'YOUR_DB';
+$db_user = 'YOUR_USER';
+$db_pass = 'YOUR_PASSWORD';

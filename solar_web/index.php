@@ -3,11 +3,11 @@
  * Solar Controller Web UI
  * Served at http://vip.home.akos.name/solar/
  *
- * Credentials are read from /etc/solar/db.php (outside web root).
+ * Credentials are read from /etc/solax/db.php (outside web root).
  * That file must define: $db_host, $db_name, $db_user, $db_pass
  */
 
-require_once '/etc/solar/db.php';
+require_once '/etc/solax/db.php';
 
 // ── DB connection ──────────────────────────────────────────────────────────
 function db(): mysqli {
@@ -29,7 +29,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
 
     if ($action === 'set_auto') {
-        db()->query("UPDATE solar_control SET manual_mode=0, updated_by='web-ui' WHERE id=1");
+        db()->query("UPDATE solax_control SET manual_mode=0, updated_by='web-ui' WHERE id=1");
         $message = 'Switched to AUTO — controller resumed.';
 
     } elseif ($action === 'set_manual') {
@@ -38,7 +38,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $forced_min_soc = is_numeric($_POST['forced_min_soc'] ?? '')
                           ? max(10, min(98, (int)$_POST['forced_min_soc'])) : null;
         $stmt = db()->prepare(
-            "UPDATE solar_control SET manual_mode=1, forced_mode=?, forced_min_soc=?, updated_by='web-ui' WHERE id=1"
+            "UPDATE solax_control SET manual_mode=1, forced_mode=?, forced_min_soc=?, updated_by='web-ui' WHERE id=1"
         );
         $stmt->bind_param('si', $forced_mode, $forced_min_soc);
         $stmt->execute();
@@ -51,10 +51,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 if (isset($_GET['msg'])) $message = htmlspecialchars($_GET['msg']);
 
 // ── Fetch data ─────────────────────────────────────────────────────────────
-$ctrl = db()->query("SELECT * FROM solar_control WHERE id=1")->fetch_assoc();
+$ctrl = db()->query("SELECT * FROM solax_control WHERE id=1")->fetch_assoc();
 
 $last = db()->query("
-    SELECT * FROM solar_decisions ORDER BY logged_at DESC LIMIT 1
+    SELECT * FROM solax_decisions ORDER BY logged_at DESC LIMIT 1
 ")->fetch_assoc();
 
 $run = db()->query("
@@ -72,7 +72,7 @@ $history = db()->query("
         SELECT *,
                LAG(target_mode)    OVER (ORDER BY logged_at) AS prev_mode,
                LAG(target_min_soc) OVER (ORDER BY logged_at) AS prev_soc
-        FROM solar_decisions
+        FROM solax_decisions
         WHERE logged_at >= NOW() - INTERVAL 48 HOUR
     ) t
     WHERE prev_mode IS NULL OR prev_mode != target_mode OR prev_soc != target_min_soc

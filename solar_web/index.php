@@ -63,9 +63,13 @@ $last = db()->query("
     SELECT * FROM solax_decisions ORDER BY logged_at DESC LIMIT 1
 ")->fetch();
 
-$run = db()->query("
-    SELECT * FROM PV_run ORDER BY pdtime DESC LIMIT 1
-")->fetch();
+try {
+    $run = db()->query("
+        SELECT * FROM PV_run ORDER BY pdtime DESC LIMIT 1
+    ")->fetch();
+} catch (PDOException $e) {
+    $run = null; // PV_run table not yet created (poller hasn't connected to inverter)
+}
 
 // Show only rows where mode or min SOC changed from the previous decision.
 // LAG() over all recent rows detects the transitions; limit to last 48 h so

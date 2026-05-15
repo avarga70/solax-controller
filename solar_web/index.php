@@ -4,21 +4,26 @@
  * Served at http://vip.home.akos.name/solar/
  *
  * Credentials are read from /etc/solax/db.php (outside web root).
- * That file must define: $db_host, $db_name, $db_user, $db_pass
+ * That file must define: $sqlite_path
  */
 
 require_once '/etc/solax/db.php';
 
 // ── DB connection ──────────────────────────────────────────────────────────
-function db(): mysqli {
-    global $db_host, $db_name, $db_user, $db_pass;
+function db(): PDO {
+    global $sqlite_path;
     static $conn = null;
     if ($conn === null) {
-        $conn = new mysqli($db_host, $db_user, $db_pass, $db_name);
-        if ($conn->connect_error) {
-            die("DB error: " . htmlspecialchars($conn->connect_error));
+        try {
+            $conn = new PDO('sqlite:' . $sqlite_path, null, null, [
+                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            ]);
+            $conn->exec("PRAGMA journal_mode=WAL");
+            $conn->exec("PRAGMA busy_timeout=10000");
+        } catch (PDOException $e) {
+            die("DB error: " . htmlspecialchars($e->getMessage()));
         }
-        $conn->set_charset('utf8mb4');
     }
     return $conn;
 }
@@ -29,7 +34,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
 
     if ($action === 'set_auto') {
-        db()->query("UPDATE solax_control SET manual_mode=0, updated_by='web-ui' WHERE id=1");
+        db()->exec("UPDATE solax_control SET manual_mode=0, updated_by='web-ui', updated_at=CURRENT_TIMESTAMP WHERE id=1");
         $message = 'Switched to AUTO — controller resumed.';
 
     } elseif ($action === 'set_manual') {
@@ -38,10 +43,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $forced_min_soc = is_numeric($_POST['forced_min_soc'] ?? '')
                           ? max(10, min(98, (int)$_POST['forced_min_soc'])) : null;
         $stmt = db()->prepare(
-            "UPDATE solax_control SET manual_mode=1, forced_mode=?, forced_min_soc=?, updated_by='web-ui' WHERE id=1"
+            "UPDATE solax_control
+             SET manual_mode=1, forced_mode=?, forced_min_soc=?, updated_by='web-ui', updated_at=CURRENT_TIMESTAMP
+             WHERE id=1"
         );
-        $stmt->bind_param('si', $forced_mode, $forced_min_soc);
-        $stmt->execute();
+        $stmt->execute([$forced_mode, $forced_min_soc]);
         $message = 'Manual override active — inverter writes suppressed.';
     }
     // PRG redirect to avoid form re-submit on refresh
@@ -51,15 +57,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 if (isset($_GET['msg'])) $message = htmlspecialchars($_GET['msg']);
 
 // ── Fetch data ─────────────────────────────────────────────────────────────
-$ctrl = db()->query("SELECT * FROM solax_control WHERE id=1")->fetch_assoc();
+$ctrl = db()->query("SELECT * FROM solax_control WHERE id=1")->fetch();
 
 $last = db()->query("
     SELECT * FROM solax_decisions ORDER BY logged_at DESC LIMIT 1
-")->fetch_assoc();
+")->fetch();
 
 $run = db()->query("
     SELECT * FROM PV_run ORDER BY pdtime DESC LIMIT 1
-")->fetch_assoc();
+")->fetch();
 
 // Show only rows where mode or min SOC changed from the previous decision.
 // LAG() over all recent rows detects the transitions; limit to last 48 h so
@@ -73,7 +79,7 @@ $history = db()->query("
                LAG(target_mode)    OVER (ORDER BY logged_at) AS prev_mode,
                LAG(target_min_soc) OVER (ORDER BY logged_at) AS prev_soc
         FROM solax_decisions
-        WHERE logged_at >= NOW() - INTERVAL 48 HOUR
+        WHERE logged_at >= datetime('now', '-48 hours')
     ) t
     WHERE prev_mode IS NULL OR prev_mode != target_mode OR prev_soc != target_min_soc
     ORDER BY logged_at DESC
@@ -185,7 +191,7 @@ $effective_price = ($last && $last['price_now'] !== null)
     <?php endif ?>
     <div class="stat-row" style="margin-top:6px">
       <span class="stat-label">Battery</span>
-      <span class="stat-val"><?= $run ? fmt_w($run['pbattp']) : '—' ?></span>
+      <span class="stat-val"><?= $run ? fmt_w($run['pbattw']) : '—' ?></span>
     </div>
     <div class="stat-row">
       <span class="stat-label">PV</span>
@@ -193,11 +199,11 @@ $effective_price = ($last && $last['price_now'] !== null)
     </div>
     <div class="stat-row">
       <span class="stat-label">Grid</span>
-      <span class="stat-val"><?= $run ? fmt_w($run['pactiT']) : '—' ?></span>
+      <span class="stat-val"><?= $run ? fmt_w($run['pgridT']) : '—' ?></span>
     </div>
     <div class="stat-row">
       <span class="stat-label">House load</span>
-      <span class="stat-val"><?= $run ? number_format((int)$run['phousT']).' W' : '—' ?></span>
+      <span class="stat-val"><?= $run ? number_format((int)$run['ploadT']).' W' : '—' ?></span>
     </div>
   </div>
 
@@ -302,7 +308,7 @@ $effective_price = ($last && $last['price_now'] !== null)
       <th>Time</th><th>Node</th><th>SOC</th><th>PV W</th><th>Grid W</th>
       <th>Price</th><th>Was</th><th>→ Mode</th><th>MinSOC</th><th>Reason</th>
     </tr>
-    <?php while ($row = $history->fetch_assoc()): ?>
+    <?php while ($row = $history->fetch()): ?>
     <tr>
       <td style="white-space:nowrap"><?= date('d.m H:i', strtotime($row['logged_at'])) ?></td>
       <td><?= htmlspecialchars($row['node_name']) ?><?= $row['test_mode'] ? ' <span style="color:var(--yellow)">T</span>' : '' ?></td>

@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-solax_poller.py — polls Solax inverter every N minutes, stores to MySQL PV_run table.
+solax_poller.py — polls Solax inverter every N minutes, stores to SQLite PV_run table.
 This replaces the Grafana DB data source used in the GoodWe installation.
 """
 
 import asyncio
 import logging
 import os
+import sqlite3
 import time
 from datetime import datetime
 
-import mysql.connector
 import solax
 
 
@@ -38,10 +38,7 @@ load_env_file(os.path.join(os.path.dirname(__file__), "config.env"))
 INVERTER_IP = os.getenv("INVERTER_IP", "")
 INVERTER_PORT = int(os.getenv("INVERTER_PORT", "80"))
 INVERTER_PASSWORD = os.getenv("INVERTER_PASSWORD", "")
-MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
-MYSQL_DB = os.getenv("MYSQL_DB", "solax")
-MYSQL_USER = os.getenv("MYSQL_USER", "solax")
-MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
+SQLITE_DB = os.getenv("SQLITE_DB", "/var/lib/solax/solax.db")
 POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "300"))
 
 logging.basicConfig(
@@ -55,17 +52,17 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 CREATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS `PV_run` (
-  `psource`  varchar(15)    NOT NULL DEFAULT 'SOLAX',
-  `pdtime`   datetime       NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  `ppv`      int            NOT NULL DEFAULT 0,
-  `pgridT`   int            NOT NULL DEFAULT 0,
-  `pbattw`   int            NOT NULL DEFAULT 0,
-  `pbatts`   decimal(6,2)   NOT NULL DEFAULT 0,
-  `ploadT`   int            NOT NULL DEFAULT 0,
-  `ptemp1`   decimal(6,2)   NOT NULL DEFAULT 0,
-  PRIMARY KEY (`psource`, `pdtime`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Solax inverter runtime readings';
+CREATE TABLE IF NOT EXISTS PV_run (
+  psource TEXT NOT NULL DEFAULT 'SOLAX',
+  pdtime  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  ppv     INTEGER NOT NULL DEFAULT 0,
+  pgridT  INTEGER NOT NULL DEFAULT 0,
+  pbattw  INTEGER NOT NULL DEFAULT 0,
+  pbatts  REAL NOT NULL DEFAULT 0,
+  ploadT  INTEGER NOT NULL DEFAULT 0,
+  ptemp1  REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY (psource, pdtime)
+)
 """
 
 
@@ -88,20 +85,12 @@ def store_reading(db, reading: dict) -> None:
     try:
         cur.execute(
             """
-            INSERT INTO PV_run (psource, pdtime, ppv, pgridT, pbattw, pbatts, ploadT, ptemp1)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-                ppv=%s, pgridT=%s, pbattw=%s, pbatts=%s, ploadT=%s, ptemp1=%s
+            INSERT OR REPLACE INTO PV_run (psource, pdtime, ppv, pgridT, pbattw, pbatts, ploadT, ptemp1)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "SOLAX",
                 datetime.now(),
-                reading["ppv"],
-                reading["pgrid"],
-                reading["pbatt"],
-                reading["soc"],
-                reading["pload"],
-                reading["temp"],
                 reading["ppv"],
                 reading["pgrid"],
                 reading["pbatt"],
@@ -116,13 +105,9 @@ def store_reading(db, reading: dict) -> None:
 
 
 def connect_db():
-    return mysql.connector.connect(
-        host=MYSQL_HOST,
-        database=MYSQL_DB,
-        user=MYSQL_USER,
-        password=MYSQL_PASSWORD,
-        autocommit=False,
-    )
+    conn = sqlite3.connect(SQLITE_DB, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
 
 
 def main() -> None:

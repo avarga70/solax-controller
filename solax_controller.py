@@ -9,7 +9,7 @@ LOOP_INTERVAL_MINUTES (default: 5).  In TEST mode it only prints what it
 Decision inputs
   - Czech OTE spot electricity prices    (spotovaelektrina.cz API)
   - Current battery SOC + inverter state (Solax local HTTP API)
-  - Historical consumption & PV patterns (MySQL PV_run table)
+  - Historical consumption & PV patterns (SQLite PV_run table)
 
 Usage
   # Normal (control) mode:
@@ -44,7 +44,7 @@ import urllib.request
 from datetime import datetime, date, timedelta
 from typing import Optional
 
-import mysql.connector
+import sqlite3
 import solax
 
 
@@ -103,10 +103,7 @@ def _req(key: str) -> str:
 INVERTER_IP        = os.getenv("INVERTER_IP", "")
 INVERTER_PORT      = int(os.getenv("INVERTER_PORT", "80"))
 INVERTER_PASSWORD  = os.getenv("INVERTER_PASSWORD", "")
-MYSQL_HOST         = _req("MYSQL_HOST")
-MYSQL_DB           = _req("MYSQL_DB")
-MYSQL_USER         = _req("MYSQL_USER")
-MYSQL_PASSWORD     = _req("MYSQL_PASSWORD")
+SQLITE_DB          = os.getenv("SQLITE_DB", "/var/lib/solax/solax.db")
 
 PV_SOURCE          = os.getenv("PV_SOURCE", "SOLAX")
 BATTERY_CAPACITY   = int(os.getenv("BATTERY_CAPACITY_WH", "7100"))   # Wh usable battery capacity
@@ -163,7 +160,7 @@ BATTERY_EFFICIENCY = float(os.getenv("BATTERY_EFFICIENCY", "0.92"))  # 0–1 (8%
 
 # ── Scheduled fixed loads ────────────────────────────────────────────────────
 # Known daily loads that must be guaranteed in load_remaining_wh even when
-# MySQL historical averages underestimate them.  Set DHW_WH=0 to disable.
+# SQLite historical averages underestimate them.  Set DHW_WH=0 to disable.
 DHW_START_HOUR = int(os.getenv("DHW_START_HOUR", "14"))   # inclusive
 DHW_END_HOUR   = int(os.getenv("DHW_END_HOUR",   "15"))   # exclusive
 DHW_WH         = int(os.getenv("DHW_WH",          "0"))   # Wh (e.g. 2550)
@@ -198,7 +195,7 @@ _export_blocked: Optional[bool] = None     # None = first cycle (state unknown)
 
 def fetch_prices(tomorrow: bool = False) -> Optional[dict[int, float]]:
     """
-    Return {hour(0-23): price_eur_mwh} from the local EL_dailypr MySQL table.
+    Return {hour(0-23): price_czk_mwh} from the local EL_dailypr SQLite table.
     Cached in memory for 1 hour — prices don't change within an hour.
     """
     cache_key = "tomorrow" if tomorrow else "today"
@@ -206,16 +203,17 @@ def fetch_prices(tomorrow: bool = False) -> Optional[dict[int, float]]:
     if _price_cache.get("_tag_" + cache_key) == cache_tag and cache_key in _price_cache:
         return _price_cache[cache_key]
 
+    target_date = (datetime.now().date() + timedelta(days=1 if tomorrow else 0)).isoformat()
     sql = """
         SELECT etime, eprczk
         FROM EL_dailypr
-        WHERE edate = DATE_ADD(CURDATE(), INTERVAL %s DAY)
+        WHERE edate = ?
         ORDER BY etime
     """
     try:
         conn = db_connect()
         cur  = conn.cursor()
-        cur.execute(sql, (1 if tomorrow else 0,))
+        cur.execute(sql, (target_date,))
         rows = cur.fetchall()
         cur.close()
         conn.close()
@@ -226,7 +224,7 @@ def fetch_prices(tomorrow: bool = False) -> Optional[dict[int, float]]:
             else:
                 log.warning(f"EL_dailypr: no prices for {'tomorrow' if tomorrow else 'today'}")
             return None
-        prices = {int(h): float(p) for h, p in rows}
+        prices = {int(row["etime"]): float(row["eprczk"]) for row in rows}
         _price_cache[cache_key] = prices
         _price_cache["_tag_" + cache_key] = cache_tag
         return prices
@@ -433,37 +431,38 @@ def price_summary(prices: dict[int, float], cheap_thr: float, expensive_thr: flo
     )
 
 
-# ── MySQL Historical Patterns ─────────────────────────────────────────────────
+# ── SQLite Historical Patterns ───────────────────────────────────────────────
 
 def db_connect():
-    return mysql.connector.connect(
-        host=MYSQL_HOST, database=MYSQL_DB,
-        user=MYSQL_USER, password=MYSQL_PASSWORD,
-        connection_timeout=10,
-    )
+    conn = sqlite3.connect(SQLITE_DB, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
 
 
 _DECISIONS_DDL = """
 CREATE TABLE IF NOT EXISTS solax_decisions (
-    id           BIGINT       NOT NULL AUTO_INCREMENT,
-    logged_at    DATETIME     NOT NULL,
-    node_name    VARCHAR(100) NOT NULL,
-    is_leader    TINYINT(1)   NOT NULL,
-    test_mode    TINYINT(1)   NOT NULL,
-    soc_pct      DECIMAL(5,1),
-    pv_w         INT,
-    grid_w       INT,
-    load_w       INT,
-    battery_w    INT,
-    price_now    DECIMAL(8,2),
-    current_mode VARCHAR(30),
-    target_mode  VARCHAR(30),
-    target_min_soc INT,
-    reason       TEXT,
-    PRIMARY KEY (id),
-    INDEX idx_logged_at (logged_at)
-) ENGINE=InnoDB COMMENT='Solax controller decision log';
+    id             INTEGER PRIMARY KEY,
+    logged_at      DATETIME NOT NULL,
+    node_name      TEXT NOT NULL,
+    is_leader      INTEGER NOT NULL,
+    test_mode      INTEGER NOT NULL,
+    soc_pct        REAL,
+    pv_w           INTEGER,
+    grid_w         INTEGER,
+    load_w         INTEGER,
+    battery_w      INTEGER,
+    price_now      REAL,
+    current_mode   TEXT,
+    target_mode    TEXT,
+    target_min_soc INTEGER,
+    reason         TEXT
+)
 """
+
+_DECISIONS_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS idx_decisions_logged_at ON solax_decisions(logged_at)"
+)
 
 
 def ensure_decisions_table() -> None:
@@ -471,6 +470,7 @@ def ensure_decisions_table() -> None:
         conn = db_connect()
         cur  = conn.cursor()
         cur.execute(_DECISIONS_DDL)
+        cur.execute(_DECISIONS_INDEX_DDL)
         conn.commit()
         cur.close()
         conn.close()
@@ -482,15 +482,19 @@ def ensure_decisions_table() -> None:
 
 _CONTROL_DDL = """
 CREATE TABLE IF NOT EXISTS solax_control (
-    id           INT          NOT NULL DEFAULT 1,
-    manual_mode  TINYINT(1)   NOT NULL DEFAULT 0  COMMENT '1 = manual, 0 = auto',
-    forced_mode  VARCHAR(20)      NULL             COMMENT 'ECO_CHARGE / BACKUP / GENERAL',
-    forced_min_soc INT            NULL             COMMENT '% min SOC when manual',
-    updated_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    updated_by   VARCHAR(64)      NULL             COMMENT 'who set the override (web/node/user)',
+    id             INTEGER NOT NULL DEFAULT 1,
+    manual_mode    INTEGER NOT NULL DEFAULT 0,
+    forced_mode    TEXT,
+    forced_min_soc INTEGER,
+    updated_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by     TEXT,
     PRIMARY KEY (id)
-) ENGINE=InnoDB COMMENT='Solax controller manual override state (single-row)';
+)
 """
+
+_CONTROL_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS idx_control_updated_at ON solax_control(updated_at)"
+)
 
 
 def ensure_control_table() -> None:
@@ -498,9 +502,10 @@ def ensure_control_table() -> None:
         conn = db_connect()
         cur  = conn.cursor()
         cur.execute(_CONTROL_DDL)
+        cur.execute(_CONTROL_INDEX_DDL)
         # Ensure the single control row exists
         cur.execute(
-            "INSERT IGNORE INTO solax_control (id, manual_mode) VALUES (1, 0)"
+            "INSERT OR IGNORE INTO solax_control (id, manual_mode) VALUES (1, 0)"
         )
         conn.commit()
         cur.close()
@@ -543,7 +548,7 @@ def log_decision(
             (logged_at, node_name, is_leader, test_mode,
              soc_pct, pv_w, grid_w, load_w, battery_w,
              price_now, current_mode, target_mode, target_min_soc, reason)
-        VALUES (%s,%s,%s,%s, %s,%s,%s,%s,%s, %s,%s,%s,%s,%s)
+        VALUES (?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?)
     """
     try:
         conn = db_connect()
@@ -561,7 +566,7 @@ def log_decision(
         cur.close()
         conn.close()
     except Exception as exc:
-        log.warning(f"Could not log decision to MySQL: {exc}")
+        log.warning(f"Could not log decision to SQLite: {exc}")
 
 
 def query_hourly_patterns(month: int) -> dict[int, dict]:
@@ -570,26 +575,27 @@ def query_hourly_patterns(month: int) -> dict[int, dict]:
     Uses the last HISTORY_MONTHS months of data for seasonal accuracy.
     Returns {hour: {avg_pv_w, avg_load_w, avg_soc_pct, avg_grid_w, n}}.
     """
+    cutoff_date = (datetime.now() - timedelta(days=30 * HISTORY_MONTHS)).strftime("%Y-%m-%d")
     sql = """
         SELECT
-            HOUR(pdtime)     AS h,
-            AVG(ppv)         AS avg_pv_w,
-            AVG(ploadT)      AS avg_load_w,
-            AVG(pbatts)      AS avg_soc_pct,
-            AVG(pgridT)      AS avg_grid_w,
-            COUNT(*)         AS n
+            CAST(strftime('%H', pdtime) AS INTEGER) AS h,
+            AVG(ppv)                                AS avg_pv_w,
+            AVG(ploadT)                             AS avg_load_w,
+            AVG(pbatts)                             AS avg_soc_pct,
+            AVG(pgridT)                             AS avg_grid_w,
+            COUNT(*)                                AS n
         FROM PV_run
-        WHERE psource  = %s
-          AND MONTH(pdtime) = %s
-          AND pdtime   >= DATE_SUB(CURDATE(), INTERVAL %s MONTH)
-        GROUP BY HOUR(pdtime)
+        WHERE psource = ?
+          AND CAST(strftime('%m', pdtime) AS INTEGER) = ?
+          AND date(pdtime) >= ?
+        GROUP BY CAST(strftime('%H', pdtime) AS INTEGER)
         ORDER BY h
     """
     result: dict[int, dict] = {}
     try:
         conn = db_connect()
-        cur  = conn.cursor(dictionary=True)
-        cur.execute(sql, (PV_SOURCE, month, HISTORY_MONTHS))
+        cur  = conn.cursor()
+        cur.execute(sql, (PV_SOURCE, month, cutoff_date))
         for row in cur.fetchall():
             result[int(row["h"])] = {
                 "avg_pv_w":    float(row["avg_pv_w"]    or 0),
@@ -601,7 +607,7 @@ def query_hourly_patterns(month: int) -> dict[int, dict]:
         cur.close()
         conn.close()
     except Exception as exc:
-        log.warning(f"MySQL query failed: {exc}")
+        log.warning(f"SQLite query failed: {exc}")
     return result
 
 
@@ -1666,7 +1672,7 @@ async def run_cycle(patterns_cache: dict) -> None:
     )
     log.info(f"  Decision → mode={target_mode}  min_soc={target_min_soc}%: {reason}")
 
-    # ── Log decision to MySQL (always, even in TEST mode) ─────────────────────
+    # ── Log decision to SQLite (always, even in TEST mode) ────────────────────
     log_decision(
         now=now,
         is_leader=is_leader,
@@ -1731,7 +1737,7 @@ async def main() -> None:
     log.info(f"  Controller   : single node  node={NODE_NAME}")
     ensure_decisions_table()
     ensure_control_table()
-    log.info(f"  Decision log : {_log_file}  +  MySQL solax_decisions table")
+    log.info(f"  Decision log : {_log_file}  +  SQLite solax_decisions table")
     log.info("━" * 70)
 
     once = "--once" in sys.argv
